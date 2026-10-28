@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Seek flash-id over WebUSB</title>
+<style>
+  :root {
+    --bg: #101418; --card: #171d24; --line: #26303a; --ink: #d7dee6;
+    --dim: #8a97a5; --ok: #4cc38a; --bad: #e5484d; --hot: #e6a23c; --accent: #58a6ff;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg: #f5f7f9; --card: #ffffff; --line: #d9e1e8; --ink: #1c2530; --dim: #5c6b7a; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 880px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--dim); font-size: 13px; margin: 0 0 20px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 16px; margin: 12px 0;
+  }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  button {
+    font: inherit; padding: 9px 16px; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--accent); color: #06121f; font-weight: 600; cursor: pointer;
+  }
+  button.ghost { background: transparent; color: var(--ink); }
+  button:disabled { opacity: .45; cursor: default; }
+  .state { font-size: 13px; color: var(--dim); }
+  .state b { color: var(--ink); }
+  table { border-collapse: collapse; font-family: var(--mono); font-size: 13px; width: 100%; }
+  th, td { border: 1px solid var(--line); padding: 4px 8px; text-align: left; }
+  th { color: var(--dim); font-weight: 500; }
+  td.on { color: var(--ok); font-weight: 700; }
+  td.off { color: var(--dim); }
+  .kv { font-family: var(--mono); font-size: 14px; margin: 2px 0; }
+  .kv .k { color: var(--dim); display: inline-block; min-width: 150px; }
+  .big { font-size: 18px; font-weight: 700; font-family: var(--mono); }
+  #log {
+    font-family: var(--mono); font-size: 12px; line-height: 1.6; white-space: pre-wrap;
+    background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+    padding: 10px; max-height: 220px; overflow-y: auto; color: var(--dim);
+  }
+  .ok { color: var(--ok); } .bad { color: var(--bad); } .hot { color: var(--hot); }
+  .hidden { display: none; }
+  h2 { font-size: 15px; margin: 0 0 10px; }
+  .foot { color: var(--dim); font-size: 12px; margin-top: 24px; line-height: 1.6; }
+  .pill { display:inline-block; padding:1px 8px; border:1px solid var(--line); border-radius:99px; font-size:12px; font-family:var(--mono); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Seek flash-id over WebUSB</h1>
+  <p class="sub">
+    Reads the SPI-flash chip identity and protection status out of a Seek Thermal
+    Compact running firmware 4.8.1.9 (289d:0010, "PIR206") — entirely from Chrome,
+    no drivers, no J-Link. <b>Strictly read-only:</b> the flash never receives a
+    write, erase or write-enable command.
+  </p>
+
+  <div class="card">
+    <div class="row">
+      <button id="connect">Connect camera</button>
+      <button id="run" class="ghost" disabled>Run flash-id probe</button>
+      <span class="state" id="state">disconnected</span>
+    </div>
+    <div class="kv" id="chipid" style="margin-top:10px"></div>
+  </div>
+
+  <div class="card hidden" id="result">
+    <h2>Probe result</h2>
+    <div class="kv"><span class="k">magic</span><span id="r-magic"></span></div>
+    <div class="kv"><span class="k">JEDEC ID</span><span class="big" id="r-jedec"></span></div>
+    <div class="kv"><span class="k">manufacturer</span><span id="r-mfr"></span></div>
+    <div class="kv"><span class="k">block locks A / B / R</span><span id="r-locks"></span></div>
+    <div id="r-tables" style="margin-top:12px"></div>
+    <div class="kv" id="r-note" style="margin-top:10px"></div>
+  </div>
+
+  <div class="card">
+    <h2>Log</h2>
+    <div id="log"></div>
+  </div>
+
+  <div class="foot">
+    How it works: the page stages a small code probe into the camera's RAM through an
+    RPC staging window (wires 90/67), arms the deferred one-shot timer (wire 89), and
+    the probe runs once from RAM with interrupts masked: it takes the SPIFI controller
+    out of memory-mapped mode, issues read commands to the flash chip (0xFF, 0x9F,
+    0x05/0x35/0x15, 0x2B, 0x3D block-lock read), restores mapped mode, and parks 16
+    result bytes where the page reads them back over the RPC window getter.
+    Requires Chrome or Edge (WebUSB) and the camera on firmware 4.8.1.9.
+    Status-register semantics per Winbond W25Q / Macronix MX25L / Spansion S25FL-P datasheets.
+  </div>
+</main>
+
+<script type="module">
+const VID = 0x289d, PID = 0x0010;
+const WIRE = { FEAT: 66, CHUNK: 67, READ: 68, RAMDATA: 90, RESET: 89, CHIPID: 54 };
+const BASE = 0x1008114A, ARG = 0x100829F8, CB = 0x10082A00;
+const STUB_B64 = "AAYGS0D0ABBA8AEAGGAYfMCyA0sbaJsH+9RwRwQwAEAcMABABksHShhgQ/gELBh7wLIFSxtomwf71ADwAQBwRwgwAEABAIA9HDAAQC3p8E+DRoWwcrZHTjNoAZNGSxAiGmAaaNAG/NRESkVJEWAZaIkH/NRDSRFgQ0oVeJL4AIAXePqy7bJf+oj4ApIYaBDwAgT70e8tG9EFIP/3sf+CRjUg//et/wdGFSD/96n/A5BP9EAw//e2/4FGT/SgIP/3sf8ERk/04CD/96z/A5sj4MItDtEFIP/3k/+CRisg//eP/wdGFSD/94v/A0YgRoFGEuABLQvRBSD/94L/gkY1IP/3fv8HRiBGgUYDRgTgIEaBRgNGB0aCRgGaMmDgJov4AGANJov4AWDsJov4AmCd+Aggi/gJMF4mACOL+ANgi/gEUIv4BYCL+AYgi/gHoIv4CHCL+AqQi/gLQIv4DACL+A0wi/gOMIv4DzBitgWwvejwjwC/GDAAQBwwAEAEMABAAAAg/wMAIJ8UMABA";
+const STUB_OFF = 2, ENTRY = 0x10081198, RES = 0x400;
+
+const $ = (id) => document.getElementById(id);
+const log = (msg, cls) => {
+  const line = document.createElement("div");
+  if (cls) line.className = cls;
+  line.textContent = msg;
+  $("log").appendChild(line);
+  $("log").scrollTop = 1e9;
+};
+const hex = (u8, sep = " ") => [...u8].map(b => b.toString(16).padStart(2, "0")).join(sep);
+
+let dev = null;
+
+// ---- transport (mirrors the bench harness) --------------------------------
+
+const set0 = (wire, data) => dev.controlTransferOut(
+  { requestType: "vendor", recipient: "interface", request: wire, value: 0, index: 0 }, data);
+
+async function get0(wire, len) {
+  const r = await dev.controlTransferIn(
+    { requestType: "vendor", recipient: "interface", request: wire, value: 0, index: 0 }, len);
+  if (r.status !== "ok") throw new Error("control IN " + r.status);
+  return new Uint8Array(r.data.buffer, r.data.byteOffset, r.data.byteLength);
+}
+
+async function rpcBulk(wire, data, timeoutMs = 2000) {
+  const frame = new Uint8Array(2 + data.length);
+  frame[0] = wire & 0xff; frame[1] = (wire >> 8) & 0xff;
+  frame.set(data, 2);
+  await dev.transferOut(2, frame);
+  try {
+    const r = await dev.transferIn(0x81, 512);
+    if (r.status === "ok") return new Uint8Array(r.data.buffer, r.data.byteOffset, r.data.byteLength);
+  } catch (e) { /* drain failures are non-fatal */ }
+  return new Uint8Array(0);
+}
+
+async function connect() {
+  dev = await navigator.usb.requestDevice({ filters: [{ vendorId: VID }] });
+  if (dev.productId !== PID) log(`note: PID 0x${dev.productId.toString(16).padStart(4, "0")} (expected 0x0010)`, "hot");
+  await dev.open();
+  await dev.selectConfiguration(1);
+  await dev.claimInterface(0);            // owns bulk IN 0x81 (reply handle)
+  await dev.claimInterface(1);
+  await dev.selectAlternateInterface(1, 1); // arm the EP2 OUT / EP1 IN RPC pair
+  $("state").innerHTML = `connected: bus ${dev.busNumber} addr ${dev.deviceAddress} — <b>${dev.productName || "PIR206"}</b>`;
+  $("run").disabled = false;
+  try {
+    const id = await get0(WIRE.CHIPID, 12);
+    $("chipid").innerHTML = `<span class="k">camera chip id (wire 54)</span><span class="pill">${hex(id)}</span>`;
+    log(`connected; wire 54 → ${hex(id)}`, "ok");
+  } catch (e) { log(`wire 54 failed: ${e.message}`, "bad"); }
+}
+
+// ---- the probe --------------------------------------------------------
+
+function buildStream() {
+  const stub = Uint8Array.from(atob(STUB_B64), c => c.charCodeAt(0));
+  const total = CB - BASE + 4;                     // 0x18BA
+  const s = new Uint8Array(total);
+  s.set(stub, STUB_OFF);
+  const w = (off, v) => new DataView(s.buffer).setUint32(off, v, true);
+  w(ARG - BASE, BASE + RES);                       // r0 = results area
+  w(CB - BASE, (ENTRY | 1) >>> 0);                 // TIMER1 callback cell
+  return s;
+}
+
+async function stageStream(stream) {
+  await set0(WIRE.RESET, Uint8Array.of(6000 & 0xff, (6000 >> 8) & 0xff)); // arm one-shot 6 s
+  const half = stream.length >> 1;
+  await set0(WIRE.RAMDATA, Uint8Array.of(0x03, 0x00, half & 0xff, (half >> 8) & 0xff, 0x00, 0x00));
+  for (let off = 0; off < stream.length; off += 508) {
+    await rpcBulk(WIRE.CHUNK, stream.subarray(off, Math.min(off + 508, stream.length)));
+    log(`  chunk @0x${off.toString(16)} ok`);
+  }
+}
+
+async function readResults() {
+  // re-arm the window (rewinds the read cursor), then walk EP0 wire-68 to 0x400
+  await set0(WIRE.RAMDATA, Uint8Array.of(0x03, 0x00, 0x20, 0x02, 0x00, 0x00));
+  let cur = 0;
+  while (cur < RES) {
+    const ask = Math.min(62, RES - cur);
+    const b = await get0(WIRE.READ, ask);
+    if (!b.length) throw new Error("short read at " + cur);
+    cur += b.length;
+  }
+  return get0(WIRE.READ, 16);
+}
+
+const dvOf = (u8) => new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+
+const DECODE = {
+  0xEF: { mfr: "Winbond W25Q (32 = EF 40 16)",
+    sr1: ["busy", "WEL", "BP0", "BP1", "BP2", "TB", "SEC", "SRP0"],
+    sr2: ["SRP1", "QE", "–", "LB1", "LB2", "LB3", "CMP", "SUS"],
+    sr3: ["–", "–", "WPS", "–", "–", "DRV", "DRV", "–"] },
+  0xC2: { mfr: "Macronix MX25L (0x35 never sent — QPI-safe)",
+    sr1: ["busy", "WEL", "BP0", "BP1", "BP2", "BP3", "QE", "SRWD"],
+    sr2: ["–", "LDSO", "–", "–", "prog-fail", "erase-fail", "WPSEL", "–"],
+    sr3: ["–", "–", "–", "TB", "–", "–", "–", "–"] },
+  0x01: { mfr: "Spansion S25FL-P",
+    sr1: ["busy", "WEL", "BP0", "BP1", "BP2", "erase-err", "prog-err", "SRWD"],
+    sr2: ["FREEZE", "QUAD", "TBPARM", "BPNV", "–", "TBPROT", "–", "–"],
+    sr3: null },
+};
+
+function bitTable(title, v, names) {
+  let rows = "";
+  for (let b = 0; b < 8; b++) {
+    const on = (v >> b) & 1, n = names ? names[b] : "bit " + b;
+    rows += `<tr><td>${b}</td><td class="${on ? "on" : "off"}">${on}</td><td class="${on ? "on" : "off"}">${n}</td></tr>`;
+  }
+  return `<div style="min-width:230px;flex:1">
+    <div class="kv"><span class="k">${title}</span>0x${v.toString(16).padStart(2, "0")}</div>
+    <table><tr><th>bit</th><th>val</th><th>name</th></tr>${rows}</table></div>`;
+}
+
+async function run() {
+  $("run").disabled = true;
+  $("result").classList.add("hidden");
+  try {
+    log("building probe stream…");
+    const stream = buildStream();
+    log(`staging ${stream.length} B through the RPC window…`);
+    await stageStream(stream);
+    log("staged; TIMER1 fires in 6 s — polling for results…");
+    const deadline = Date.now() + 30000;
+    let res = null;
+    while (Date.now() < deadline && !res) {
+      await new Promise(r => setTimeout(r, 3000));
+      try {
+        const fin = await readResults();
+        if (fin && dvOf(fin).getUint32(0, true) === 0x5EEC0DE0) res = fin;
+      } catch { /* not fired yet */ }
+    }
+    if (!res) throw new Error("probe never reported (magic 0x5EEC0DE0 not seen)");
+    const dv = new DataView(res.buffer);
+    const jedec = res.slice(4, 7), s1 = res[7], s2 = res[8], s3 = res[9];
+    const locks = [res[10], res[11], res[12]];
+    const D = DECODE[jedec[0]];
+    $("r-magic").textContent = "0x5EEC0DE0";
+    $("r-jedec").textContent = hex(jedec, " ");
+    $("r-mfr").textContent = D ? D.mfr : "unknown (raw registers below)";
+    $("r-locks").innerHTML = `${locks[0]} / ${locks[1]} / ${locks[2]}` +
+      `  <span style="color:var(--dim)">(slot A 0x030000, slot B 0x050000, recovery 0x070000; meaningful only when SR3.WPS = 1)</span>`;
+    $("r-tables").innerHTML =
+      `<div style="display:flex;gap:14px;flex-wrap:wrap">` +
+      bitTable("SR1 (0x05)", s1, D?.sr1) + bitTable("SR2 (0x35 / 0x2B)", s2, D?.sr2) +
+      bitTable("SR3 (0x15)", s3, D?.sr3) + `</div>`;
+    let note = [];
+    if (jedec[0] === 0xEF) {
+      if (s2 & 0x40) note.push(`<span class="hot">CMP=1: BP bits protect EVERYTHING except locked-out blocks</span>`);
+      if (s3 & 0x04) note.push(`WPS=1: per-block locks are in force (A/B/R above)`);
+      if (s1 & 0x1c) note.push(`BP0-2 set: hardware write protection active`);
+    }
+    note.push(`<span class="ok">read-only probe — the flash received no write/erase/WREN command</span>`);
+    $("r-note").innerHTML = note.join("<br>");
+    $("result").classList.remove("hidden");
+    log("done.", "ok");
+    const id = await get0(WIRE.CHIPID, 12).catch(() => null);
+    if (id) log(`camera wire 54 after: ${hex(id)} (still alive)`, "ok");
+  } catch (e) {
+    log("FAILED: " + (e.message || e), "bad");
+  } finally {
+    $("run").disabled = false;
+  }
+}
+
+$("connect").addEventListener("click", () => connect().catch(e => {
+  $("state").textContent = "connect failed";
+  log("connect failed: " + (e.message || e), "bad");
+}));
+$("run").addEventListener("click", run);
+if (!navigator.usb) {
+  $("connect").disabled = true;
+  log("This browser has no WebUSB. Use Chrome or Edge (desktop or Android).", "bad");
+}
+</script>
+</body>
+</html>
