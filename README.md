@@ -16,6 +16,12 @@ command; the only opcodes issued to the chip are `0xFF`, `0x9F` (JEDEC ID),
 4. The page reports JEDEC ID, manufacturer, the three status registers with
    per-bit decoding (Winbond / Macronix / Spansion), and the per-block lock bits.
 
+**Unlock Winbond** (separate button, explicit confirmation) clears the chip's
+protection bits back to factory `00/02/60` + Global Block Unlock. It writes
+ONLY the chip's protection registers — the flash array is never erased or
+programmed — and refuses safely on a non-Winbond chip or when SRP1 (hardware
+lock) is set. Run on steady power; these are permanent register writes.
+
 Result for the reference unit: `EF 40 16` (Winbond W25Q32), SR1 `00`,
 SR2 `02` (QE), SR3 `60` (drive strength), block locks `1 1 1` — matching the
 J-Link probe of the same chip byte-for-byte.
